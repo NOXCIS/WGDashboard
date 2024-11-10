@@ -26,6 +26,8 @@ from icmplib import ping, traceroute
 import threading
 
 from flask.json.provider import DefaultJSONProvider
+#Import Enviorment
+from dotenv import load_dotenv
 
 DASHBOARD_VERSION = 'v4.1.0'
 CONFIGURATION_PATH = os.getenv('CONFIGURATION_PATH', '.')
@@ -38,6 +40,36 @@ UPDATE = None
 app = Flask("WGDashboard", template_folder=os.path.abspath("./static/app/dist"))
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 5206928
 app.secret_key = secrets.token_urlsafe(32)
+
+#Docker ENV ARGS Import
+if not os.path.exists(DASHBOARD_CONF):
+    load_dotenv()
+
+awg_activate = os.environ.get('AMNEZIA_WG')
+wgd_welcome = os.environ.get('WGD_WELCOME_SESSION')
+wgd_app_port = os.environ.get('WGD_REMOTE_ENDPOINT_PORT')
+wgd_auth_req = os.environ.get('WGD_AUTH_REQ')
+wgd_user = os.environ.get('WGD_USER')
+wgd_pass = os.environ.get('WGD_PASS')
+wgd_global_dns = os.environ.get('WGD_DNS')
+wgd_peer_endpoint_allowed_ip = os.environ.get('WGD_PEER_ENDPOINT_ALLOWED_IP')
+wgd_remote_endpoint = os.environ.get('WGD_REMOTE_ENDPOINT')
+if wgd_remote_endpoint == '0.0.0.0':
+    default_interface = ifcfg.default_interface()
+    wgd_remote_endpoint = default_interface['inet']
+wgd_keep_alive = os.environ.get('WGD_KEEP_ALIVE')
+wgd_mtu = os.environ.get('WGD_MTU')
+wgd_jc = os.environ.get('WGD_JC')
+wgd_jmin = os.environ.get('WGD_JMIN')
+wgd_jmax = os.environ.get('WGD_JMAX')
+wgd_s1 = os.environ.get('WGD_S1')
+wgd_s2 = os.environ.get('WGD_S2')
+wgd_h1 = os.environ.get('WGD_H1')
+wgd_h2 = os.environ.get('WGD_H2')
+wgd_h3 = os.environ.get('WGD_H3')
+wgd_h4 = os.environ.get('WGD_H4')
+
+
 
 class ModelEncoder(JSONEncoder):
     def default(self, o: Any) -> Any:
@@ -453,6 +485,15 @@ class WireguardConfiguration:
         self.Address: str = ""
         self.DNS: str = ""
         self.Table: str = ""
+        self.Jc: str = ""
+        self.Jmin: str = ""
+        self.Jmax: str = ""
+        self.S1: str = ""
+        self.S2: str = ""
+        self.H1: str = ""
+        self.H2: str = ""
+        self.H3: str = ""
+        self.H4: str = ""
         self.MTU: str = ""
         self.PreUp: str = ""
         self.PostUp: str = ""
@@ -720,6 +761,7 @@ class WireguardConfiguration:
                 self.Peers.append(Peer(i, self))
             
     def addPeers(self, peers: list):
+        interface_address = self.get_awg_iface_address()
         try:
             for i in peers:
                 newPeer = {
@@ -755,8 +797,22 @@ class WireguardConfiguration:
             for p in peers:
                 subprocess.check_output(f"wg set {self.Name} peer {p['id']} allowed-ips {p['allowed_ip']}",
                                         shell=True, stderr=subprocess.STDOUT)
+                presharedKeyExist = len(p['preshared_key']) > 0
+                rd = random.Random()
+                uid = uuid.UUID(int=rd.getrandbits(128), version=4)
+                if presharedKeyExist:
+                    with open(f"{uid}", "w+") as f:
+                        f.write(p['preshared_key'])
+                        
+                subprocess.check_output(f"wg set {self.Name} peer {p['id']} allowed-ips {p['allowed_ip']}{f' preshared-key {uid}' if presharedKeyExist else ''}",
+                                        shell=True, stderr=subprocess.STDOUT)
             subprocess.check_output(
                 f"wg-quick save {self.Name}", shell=True, stderr=subprocess.STDOUT)
+            
+            write_error = self.patch_awg_iface_address(interface_address)
+            if write_error:
+                return write_error  
+
             self.getPeersList()
             return True
         except Exception as e:
@@ -772,7 +828,7 @@ class WireguardConfiguration:
     def allowAccessPeers(self, listOfPublicKeys):
         if not self.getStatus():
             self.toggleConfiguration()
-        
+        interface_address = self.get_awg_iface_address()
         for i in listOfPublicKeys:
             p = sqlSelect("SELECT * FROM '%s_restrict_access' WHERE id = ?" % self.Name, (i,)).fetchone()
             if p is not None:
@@ -795,6 +851,10 @@ class WireguardConfiguration:
                 return ResponseObject(False, "Failed to allow access of peer " + i)
         if not self.__wgSave():
             return ResponseObject(False, "Failed to save configuration through WireGuard")
+        
+        write_error = self.patch_awg_iface_address(interface_address)
+        if write_error:
+            return write_error
 
         self.__getPeers()
         return ResponseObject(True, "Allow access successfully")
@@ -804,6 +864,7 @@ class WireguardConfiguration:
         numOfFailedToRestrictPeers = 0
         if not self.getStatus():
             self.toggleConfiguration()
+        interface_address = self.get_awg_iface_address()    
         for p in listOfPublicKeys:
             found, pf = self.searchPeer(p)
             if found:
@@ -821,6 +882,10 @@ class WireguardConfiguration:
 
         if not self.__wgSave():
             return ResponseObject(False, "Failed to save configuration through WireGuard")
+        
+        write_error = self.patch_awg_iface_address(interface_address)
+        if write_error:
+            return write_error
 
         self.__getPeers()
 
@@ -835,6 +900,7 @@ class WireguardConfiguration:
         numOfFailedToDeletePeers = 0
         if not self.getStatus():
             self.toggleConfiguration()
+        interface_address = self.get_awg_iface_address()      
         for p in listOfPublicKeys:
             found, pf = self.searchPeer(p)
             if found:
@@ -848,6 +914,10 @@ class WireguardConfiguration:
 
         if not self.__wgSave():
             return ResponseObject(False, "Failed to save configuration through WireGuard")
+        
+        write_error = self.patch_awg_iface_address(interface_address)
+        if write_error:
+            return write_error
 
         self.__getPeers()
 
@@ -855,6 +925,30 @@ class WireguardConfiguration:
             return ResponseObject(True, f"Deleted {numOfDeletedPeers} peer(s)")
         return ResponseObject(False,
                               f"Deleted {numOfDeletedPeers} peer(s) successfully. Failed to delete {numOfFailedToDeletePeers} peer(s)")
+
+    def get_awg_iface_address(self):
+        try:
+            interface_address = subprocess.check_output(
+                f"ip addr show {self.Name} | grep 'inet ' | awk '{{print $2}}'",
+                shell=True).decode().strip()
+            return interface_address
+        except subprocess.CalledProcessError:
+            return None  # or handle the error as needed
+
+    def patch_awg_iface_address(self, interface_address):
+        try:
+            with open(f"/etc/wireguard/{self.Name}.conf", "r") as conf_file:
+                lines = conf_file.readlines()
+
+            interface_index = next((i for i, line in enumerate(lines) if line.strip() == "[Interface]"), None)
+            address_present = any(line.strip().startswith("Address") for line in lines)
+
+            if interface_index is not None and not address_present:
+                lines.insert(interface_index + 1, f"Address = {interface_address}\n")
+                with open(f"/etc/wireguard/{self.Name}.conf", "w") as conf_file:
+                    conf_file.writelines(lines)
+        except IOError:
+            return ResponseObject(False, "Failed to write the interface address to the config file")
 
     def __savePeers(self):
         for i in self.Peers:
@@ -1256,6 +1350,25 @@ MTU = {str(self.mtu)}
 '''
         if len(self.DNS) > 0:
             peerConfiguration += f"DNS = {self.DNS}\n"
+
+        # Conditional block based on awg_activate
+
+        # Retrieve and normalize activation state for `amneziawg_activate`
+        awg_state = DashboardConfig.GetConfig("Server", "amneziawg_activate")[1]
+        if str(awg_state).strip().lower() == "true":
+            peerConfiguration += f'''
+Jc = {DashboardConfig.GetConfig("Peers", "jc")[1]}
+Jmin = {DashboardConfig.GetConfig("Peers", "jmin")[1]}
+Jmax = {DashboardConfig.GetConfig("Peers", "jmax")[1]}
+S1 = {DashboardConfig.GetConfig("Peers", "s1")[1]}
+S2 = {DashboardConfig.GetConfig("Peers", "s2")[1]}
+H1 = {DashboardConfig.GetConfig("Peers", "h1")[1]}
+H2 = {DashboardConfig.GetConfig("Peers", "h2")[1]}
+H3 = {DashboardConfig.GetConfig("Peers", "h3")[1]}
+H4 = {DashboardConfig.GetConfig("Peers", "h4")[1]}
+'''
+
+
         peerConfiguration += f'''
 [Peer]
 PublicKey = {self.configuration.PublicKey}
@@ -1313,18 +1426,19 @@ class DashboardConfig:
         self.hiddenAttribute = ["totp_key"]
         self.__default = {
             "Account": {
-                "username": "admin",
-                "password": "admin",
+                "username": wgd_user,
+                "password": wgd_pass,
                 "enable_totp": "false",
                 "totp_verified": "false",
                 "totp_key": pyotp.random_base32()
             },
             "Server": {
+                "amneziawg_activate": awg_activate,
                 "wg_conf_path": "/etc/wireguard",
                 "app_prefix": "",
                 "app_ip": "0.0.0.0",
-                "app_port": "10086",
-                "auth_req": "true",
+                "app_port": wgd_app_port,
+                "auth_req": wgd_auth_req,
                 "version": DASHBOARD_VERSION,
                 "dashboard_refresh_interval": "60000",
                 "dashboard_sort": "status",
@@ -1333,15 +1447,24 @@ class DashboardConfig:
                 "dashboard_language": "en"
             },
             "Peers": {
-                "peer_global_DNS": "1.1.1.1",
-                "peer_endpoint_allowed_ip": "0.0.0.0/0",
+                "peer_global_DNS": wgd_global_dns,
+                "peer_endpoint_allowed_ip": wgd_peer_endpoint_allowed_ip,
                 "peer_display_mode": "grid",
-                "remote_endpoint": ifcfg.default_interface()['inet'] if ifcfg.default_interface() else '',
-                "peer_MTU": "1420",
-                "peer_keep_alive": "21"
+                "remote_endpoint": wgd_remote_endpoint,
+                "peer_MTU": wgd_mtu,
+                "peer_keep_alive": wgd_keep_alive,
+                "jc": wgd_jc,
+                "jmin": wgd_jmin,
+                "jmax": wgd_jmax,
+                "s1": wgd_s1,
+                "s2": wgd_s2,
+                "h1": wgd_h1,
+                "h2": wgd_h2,
+                "h3": wgd_h3,
+                "h4": wgd_h4
             },
             "Other": {
-                "welcome_session": "true"
+                "welcome_session": wgd_welcome
             },
             "Database":{
                 "type": "sqlite"
